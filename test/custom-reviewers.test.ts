@@ -1,6 +1,8 @@
 // Custom reviewers: definition files, and reviewers of the description and of the code that
 // review only their repositories, may approve, and are one bot each.
 import { gitconfig } from './helpers/env.ts';
+import { withFakes } from './helpers/fakes.ts';
+import { until } from './helpers/until.ts';
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
@@ -225,14 +227,6 @@ const sha = (cwd: string) => git(cwd, 'rev-parse', 'HEAD');
 /** What the merge box says each reviewer agent found in the last round, as text. */
 const round = (path: string) => page(path).then((html) => (html.match(/<div class="iterations-found">([^]*?)<\/div>/)?.[1] ?? '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
 const runStatus = (id: number) => server.service.db.get<{ status: string }>('SELECT status FROM review_runs WHERE id = ?', id)!.status;
-
-/** Until `check` holds, for up to `ms`: what a watcher on the files hears comes in its own time. */
-async function eventually(check: () => Promise<boolean> | boolean, ms = 8000): Promise<void> {
-  for (const end = Date.now() + ms; !(await check()); ) {
-    assert.ok(Date.now() < end, 'not in time');
-    await new Promise((r) => setTimeout(r, 50));
-  }
-}
 
 test('definitions are read when the server starts; those that can not run say why', async () => {
   const list = await human('GET', '/api/settings/reviewers');
@@ -494,7 +488,7 @@ test('an edit while the author waits has the reviewer of the description review 
   // Nothing more to say about this version: the author waits for the reviewer.
   const id = row('acme', number).id;
   const waiting = wait(acme, number);
-  await eventually(() => (server.service.waiters.get(id) ?? 0) > 0);
+  await until(() => (server.service.waiters.get(id) ?? 0) > 0, 'the author waits');
   process.env.FAKE_CLAUDE_REVIEW = JSON.stringify({ summary: 'Say what it subtracts.', verdict: 'comment', comments: [{ about: 'title', commit: null, priority: 'low', body: 'What is subtracted?' }] });
   await human('PATCH', `/api/repos/acme/widgets/pulls/${number}`, { title: 'Subtract' });
   assert.match(await waiting, /Say what it subtracts\./);
@@ -674,45 +668,44 @@ test('a reviewer keeps its name, which nobody else may have, and comes back with
   // Deleted while it reviews: the review is interrupted by the time deleting returns, so the
   // reviewer defined again right after never finds it still running.
   const gate = join(dir, 'gate-deleted');
-  process.env.FAKE_CLAUDE_GATE = gate;
-  process.env.FAKE_CLAUDE_REVIEW = JSON.stringify({ summary: 'Fine.', verdict: 'approve', comments: [] });
-  const old = reviewer('house-rules');
-  const { run_id } = await human('POST', '/api/repos/acme/widgets/pulls/1/reviewers/house-rules');
-  const runs = (await human('GET', '/api/repos/acme/widgets/pulls/1/reviewers/house-rules')).runs.length;
-  server.service.custom!.remove('house-rules');
-  assert.equal(runStatus(run_id), 'interrupted');
-  writeFileSync(gate, '');
-  await old.settle(row('acme', 1).id);
-  delete process.env.FAKE_CLAUDE_GATE;
-  assert.equal(existsSync(join(reviewersDir, 'house-rules.md')), false);
-  // Its name in another case is its bot's too.
-  assert.match((await human('POST', '/api/settings/reviewers', { name: 'House-Rules', engine: 'claude' }, 422)).message, /"House-Rules" is already used by house-rules/);
-  // Its bot stays its own: a CLI caller by its name would pass for it, with approvals that count.
-  const claim = await cli(acme, ['pr', 'list'], { actor: 'house-rules' });
-  assert.notEqual(claim.code, 0);
-  assert.match(claim.stderr, /"house-rules" is the name of a custom reviewer/);
-  assert.doesNotMatch(await page('/acme/widgets/pull/1'), /id="agent-house-rules"/);
-  assert.match(await page('/acme/widgets/pull/1'), /house-rules<\/a><span class="Label Label--bot">bot<\/span> approved the description/, 'its reviews stay');
-  const reviews = server.service.db.all<ReviewRow>("SELECT * FROM reviews WHERE pull_id = ? AND state != 'PENDING'", row('acme', 1).id);
-  assert.ok(reviews.some((r) => r.state === 'APPROVED'));
-  assert.equal(server.service.reviewDecision(row('acme', 1), reviews), 'REVIEW_REQUIRED', 'and stand in for nobody');
-  // Their transcripts too.
-  const first = server.service.db.get<{ id: number }>("SELECT id FROM review_runs WHERE pull_id = ? AND reviewer = 'house-rules' AND review_id IS NOT NULL ORDER BY id", row('acme', 1).id)!.id;
-  assert.match(await page('/acme/widgets/pull/1'), new RegExp(`<a class="review-run-link" href="/acme/widgets/pull/1/runs/${first}">`));
-  const transcript = await fetch(`${server.url}/acme/widgets/pull/1/runs/${first}`);
-  assert.equal(transcript.status, 200);
-  assert.match(await transcript.text(), /house-rules/);
+  await withFakes({ FAKE_CLAUDE_GATE: gate, FAKE_CLAUDE_REVIEW: JSON.stringify({ summary: 'Fine.', verdict: 'approve', comments: [] }) }, async () => {
+    const old = reviewer('house-rules');
+    const { run_id } = await human('POST', '/api/repos/acme/widgets/pulls/1/reviewers/house-rules');
+    const runs = (await human('GET', '/api/repos/acme/widgets/pulls/1/reviewers/house-rules')).runs.length;
+    server.service.custom!.remove('house-rules');
+    assert.equal(runStatus(run_id), 'interrupted');
+    writeFileSync(gate, '');
+    await old.settle(row('acme', 1).id);
+    assert.equal(existsSync(join(reviewersDir, 'house-rules.md')), false);
+    // Its name in another case is its bot's too.
+    assert.match((await human('POST', '/api/settings/reviewers', { name: 'House-Rules', engine: 'claude' }, 422)).message, /"House-Rules" is already used by house-rules/);
+    // Its bot stays its own: a CLI caller by its name would pass for it, with approvals that count.
+    const claim = await cli(acme, ['pr', 'list'], { actor: 'house-rules' });
+    assert.notEqual(claim.code, 0);
+    assert.match(claim.stderr, /"house-rules" is the name of a custom reviewer/);
+    assert.doesNotMatch(await page('/acme/widgets/pull/1'), /id="agent-house-rules"/);
+    assert.match(await page('/acme/widgets/pull/1'), /house-rules<\/a><span class="Label Label--bot">bot<\/span> approved the description/, 'its reviews stay');
+    const reviews = server.service.db.all<ReviewRow>("SELECT * FROM reviews WHERE pull_id = ? AND state != 'PENDING'", row('acme', 1).id);
+    assert.ok(reviews.some((r) => r.state === 'APPROVED'));
+    assert.equal(server.service.reviewDecision(row('acme', 1), reviews), 'REVIEW_REQUIRED', 'and stand in for nobody');
+    // Their transcripts too.
+    const first = server.service.db.get<{ id: number }>("SELECT id FROM review_runs WHERE pull_id = ? AND reviewer = 'house-rules' AND review_id IS NOT NULL ORDER BY id", row('acme', 1).id)!.id;
+    assert.match(await page('/acme/widgets/pull/1'), new RegExp(`<a class="review-run-link" href="/acme/widgets/pull/1/runs/${first}">`));
+    const transcript = await fetch(`${server.url}/acme/widgets/pull/1/runs/${first}`);
+    assert.equal(transcript.status, 200);
+    assert.match(await transcript.text(), /house-rules/);
 
-  // Written by hand again, it is the same reviewer: its bot and its runs, and the review asked
-  // for by hand that deleting interrupted runs again.
-  writeFileSync(join(reviewersDir, 'house-rules.md'), '---\nengine: claude\nrepos: [acme/*]\nreviews: description\n---\nThe title is in the imperative.\n');
-  server.service.custom!.load();
-  await reviewer('house-rules').settle(row('acme', 1).id);
-  const again = (await human('GET', '/api/repos/acme/widgets/pulls/1/reviewers/house-rules')).runs;
-  assert.equal(again.length, runs + 1);
-  assert.deepEqual(again.slice(-2).map((r: any) => [r.trigger, r.status]), [['manual', 'interrupted'], ['manual', 'done']]);
-  assert.equal(server.service.db.all("SELECT * FROM actors WHERE login = 'house-rules'").length, 1);
-  assert.match(await page('/acme/widgets/pull/1'), /id="agent-house-rules"/);
+    // Written by hand again, it is the same reviewer: its bot and its runs, and the review asked
+    // for by hand that deleting interrupted runs again.
+    writeFileSync(join(reviewersDir, 'house-rules.md'), '---\nengine: claude\nrepos: [acme/*]\nreviews: description\n---\nThe title is in the imperative.\n');
+    server.service.custom!.load();
+    await reviewer('house-rules').settle(row('acme', 1).id);
+    const again = (await human('GET', '/api/repos/acme/widgets/pulls/1/reviewers/house-rules')).runs;
+    assert.equal(again.length, runs + 1);
+    assert.deepEqual(again.slice(-2).map((r: any) => [r.trigger, r.status]), [['manual', 'interrupted'], ['manual', 'done']]);
+    assert.equal(server.service.db.all("SELECT * FROM actors WHERE login = 'house-rules'").length, 1);
+    assert.match(await page('/acme/widgets/pull/1'), /id="agent-house-rules"/);
+  });
 });
 
 test('the reviewer agents\' approvals are their own for `pr wait` too: it says which approvals came before a new review', async () => {
@@ -826,12 +819,13 @@ test('the reviewers\' directory is made at start and followed, also once it is r
   try {
     assert.ok(existsSync(fresh));
     writeFileSync(join(fresh, 'first.md'), '---\nengine: claude\n---\n');
-    await eventually(async () => (await names()).includes('first'));
+    // What a watcher on the files hears comes in its own time.
+    await until(async () => (await names()).includes('first'), 'the new definition is read');
     rmSync(fresh, { recursive: true });
-    await eventually(async () => (await names()).length === 0);
+    await until(async () => (await names()).length === 0, 'the removed directory leaves no reviewers');
     mkdirSync(fresh);
     writeFileSync(join(fresh, 'second.md'), '---\nengine: claude\n---\n');
-    await eventually(async () => (await names()).join() === 'second');
+    await until(async () => (await names()).join() === 'second', 'the directory made again is followed');
   } finally {
     await other.close();
   }
